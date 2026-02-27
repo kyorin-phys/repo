@@ -2,93 +2,106 @@ import streamlit as st
 import requests
 from rapidfuzz import fuzz
 import xml.etree.ElementTree as ET
+import re
 
-st.set_page_config(page_title="文献実在性チェッカー (日英対応)", layout="wide")
+st.set_page_config(page_title="文献検閲ツール", layout="wide")
 
-st.title("🛡️ 参考文献・実在性チェッカー")
-st.markdown("学生のレポートにある参考文献を1行ずつチェックし、架空の文献（ハルシネーション）を炙り出します。")
+# --- ロジック：ノイズ除去 ---
+def clean_query(text):
+    """著者名や年号、行番号などのノイズを削り、タイトル周辺を抽出する"""
+    # 1. 先頭の数字や記号（1. など）を削除
+    text = re.sub(r'^\d+[\.\s\-、]+', '', text)
+    # 2. (2020) などの年号以降をタイトル候補として抽出
+    match = re.search(r'\(\d{4}\)\.?\s*(.*)', text)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
 
-# --- 検索ロジック関数 ---
+# --- ロジック：DB検索（上位5件から最良のものを探す） ---
+def search_bibliographies(query):
+    query_core = clean_query(query)
+    results = []
 
-def search_crossref(query):
-    """海外論文DB (Crossref) で検索"""
+    # 1. Crossref検索
     try:
-        url = "https://api.crossref.org/works"
-        res = requests.get(url, params={"query": query, "rows": 1}, timeout=5).json()
-        items = res.get("message", {}).get("items", [])
-        if items:
-            title = items[0].get("title", [""])[0]
-            doi = items[0].get("DOI", "")
-            return title, f"https://doi.org/{doi}", "Crossref (海外)"
-    except:
-        pass
-    return None, None, None
+        res = requests.get("https://api.crossref.org/works", 
+                           params={"query": query_core, "rows": 5}, timeout=5).json()
+        for item in res.get("message", {}).get("items", []):
+            title = item.get("title", [""])[0]
+            link = f"https://doi.org/{item.get('DOI', '')}"
+            score = fuzz.token_sort_ratio(query.lower(), title.lower())
+            results.append({"title": title, "link": link, "score": score, "source": "Crossref"})
+    except: pass
 
-def search_cinii(query):
-    """日本論文DB (CiNii Research) で検索"""
+    # 2. CiNii検索
     try:
-        # RSS(OpenSearch)を利用した簡易検索
-        url = "https://ci.nii.ac.jp/opensearch/author"
-        res = requests.get(url, params={"q": query, "count": 1}, timeout=5)
+        res = requests.get("https://ci.nii.ac.jp/opensearch/author", 
+                           params={"q": query_core, "count": 3}, timeout=5)
         root = ET.fromstring(res.text)
-        # XMLからタイトルと言語、リンクを抽出
-        ns = {'atom': 'http://www.w3.org/2005/Atom', 'dc': 'http://purl.org/dc/elements/1.1/'}
-        entry = root.find('atom:entry', ns)
-        if entry is not None:
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
+        for entry in root.findall('atom:entry', ns):
             title = entry.find('atom:title', ns).text
             link = entry.find('atom:link', ns).attrib['href']
-            return title, link, "CiNii (国内)"
-    except:
-        pass
-    return None, None, None
+            score = fuzz.token_sort_ratio(query.lower(), title.lower())
+            results.append({"title": title, "link": link, "score": score, "source": "CiNii"})
+    except: pass
 
-# --- UI部分 ---
+    if not results:
+        return None
+    # スコアが最も高いものを返す
+    return max(results, key=lambda x: x['score'])
 
-with st.sidebar:
-    st.header("判定の見方")
-    st.success("✅ **実在確実**: タイトルがほぼ一致。")
-    st.warning("⚠️ **要確認**: 似た論文はあるがタイトルが異なる。")
-    st.error("🚨 **捏造の疑い**: どのDBにも存在しません。")
+# --- UI：メイン画面 ---
+st.title("🛡️ 文献実在チェッカー (改良版)")
+st.markdown("先生の手間を最小化するため、**「実在が怪しいもの」**を優先的に表示します。")
 
-input_text = st.text_area("参考文献リストを貼り付けてください", height=200)
+input_text = st.text_area("参考文献リストを貼り付けてください（1行1文献）", height=200)
 
-if st.button("一括チェック実行"):
+if st.button("チェック実行"):
     if not input_text.strip():
         st.info("テキストを入力してください。")
     else:
         lines = [l.strip() for l in input_text.split('\n') if l.strip()]
         
+        # 結果を格納するリスト
+        verified = []
+        suspicious = []
+
         for line in lines:
-            with st.spinner(f"検索中: {line[:30]}..."):
-                # 1. Crossrefで検索
-                found_title, link, source = search_crossref(line)
+            with st.spinner(f"検証中... {line[:20]}"):
+                best_match = search_bibliographies(line)
                 
-                # 2. 見つからない、または類似度が低い場合はCiNiiで検索
-                if not found_title or fuzz.token_sort_ratio(line.lower(), found_title.lower()) < 60:
-                    cinii_title, cinii_link, cinii_source = search_cinii(line)
-                    if cinii_title:
-                        found_title, link, source = cinii_title, cinii_link, cinii_source
-                
-                # 判定と表示
-                if found_title:
-                    score = fuzz.token_sort_ratio(line.lower(), found_title.lower())
-                    
-                    if score > 85:
-                        st.success(f"✅ **実在確実** (スコア:{score:.0f} / 出典:{source})")
-                        st.write(f"DB上のタイトル: **{found_title}**")
-                        st.caption(f"[リンクを開く]({link})")
-                    elif score > 40:
-                        st.warning(f"⚠️ **要確認** (スコア:{score:.0f} / 出典:{source})")
-                        st.write(f"入力: {line}")
-                        st.write(f"DB上の近似論文: **{found_title}**")
-                        st.caption(f"[この論文が元ネタか確認する]({link})")
-                    else:
-                        st.error(f"🚨 **捏造の疑い大** (スコア:{score:.0f})")
-                        st.write(f"入力: {line}")
-                        st.markdown(f"[Google Scholarで最終確認](https://scholar.google.com/scholar?q={line.replace(' ', '+')})")
+                if best_match and best_match['score'] >= 85:
+                    verified.append((line, best_match))
                 else:
-                    st.error(f"🚨 **捏造の疑い大** (DBにヒットなし)")
-                    st.write(f"入力: {line}")
-                    st.markdown(f"[Google Scholarで最終確認](https://scholar.google.com/scholar?q={line.replace(' ', '+')})")
-            
-            st.divider()
+                    suspicious.append((line, best_match))
+
+        # --- 表示フェーズ ---
+        
+        # 1. 疑わしい文献（ここを重点的に見る）
+        st.subheader(f"🚨 要確認・捏造の疑い ({len(suspicious)}件)")
+        if not suspicious:
+            st.success("疑わしい文献は見つかりませんでした！")
+        for line, match in suspicious:
+            with st.expander(f"⚠️ {line[:60]}...", expanded=True):
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    st.error("**学生の入力:**")
+                    st.write(line)
+                with col2:
+                    if match:
+                        st.warning(f"**DB上の最も近い文献** (一致度: {match['score']:.0f}%)")
+                        st.write(match['title'])
+                        st.caption(f"[出典: {match['source']} / リンク]({match['link']})")
+                    else:
+                        st.error("**該当なし**")
+                        st.write("学術データベースに類似する文献が一切見つかりません。")
+                st.markdown(f"🔍 [Google Scholarで検索](https://scholar.google.com/scholar?q={line.replace(' ', '+')})")
+
+        st.divider()
+
+        # 2. 実在が確認された文献（基本スルーでOK）
+        with st.expander(f"✅ 実在確認済み ({len(verified)}件)"):
+            for line, match in verified:
+                st.write(f"🟢 **{match['title']}**")
+                st.caption(f"入力: {line}")
