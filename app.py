@@ -16,6 +16,11 @@ STOPWORDS = {
     'not', 'but', 'its', 'via', 'using', 'based', 'new', 'study', 'into',
     'some', 'has', 'have', 'been', 'their', 'they', 'were', 'will', 'also',
     'when', 'than', 'more', 'such', 'each', 'over', 'both', 'after', 'under',
+    # 雑誌名・出版社・arXivなど文献メタ情報にありがちな語
+    'preprint', 'arxiv', 'journal', 'advances', 'systems', 'processing',
+    'information', 'nature', 'science', 'review', 'research', 'press',
+    'proceedings', 'conference', 'workshop', 'transactions', 'letters',
+    'international', 'annual', 'springer', 'elsevier', 'wiley',
 }
 
 CROSSREF_SELECT = "DOI,title,author,published,container-title,score"
@@ -24,8 +29,11 @@ CROSSREF_SELECT = "DOI,title,author,published,container-title,score"
 # ─────────────────────────────────────────────
 # 入力パーサー
 # ─────────────────────────────────────────────
-def parse_reference(line: str) -> dict:
-    """年・DOI・タイトルキーワードを抽出する。書き方の順序には依存しない。"""
+def parse_reference(line: str, author_families: list = None) -> dict:
+    """
+    年・DOI・タイトルキーワードを抽出する。書き方の順序には依存しない。
+    author_families: CrossRefから取得した著者姓リスト。渡すとKWから除外される。
+    """
     info = {"raw": line, "years": [], "doi": None, "title_keywords": []}
 
     # 年（グループなし4桁マッチ）
@@ -37,14 +45,21 @@ def parse_reference(line: str) -> dict:
         info["doi"] = doi_match.group(0).rstrip('.')
 
     # タイトルキーワード抽出:
-    # 年・巻号・ページ・DOI を除去してから4文字以上の英単語を取る
+    # 年・巻号・ページ・DOI・arXiv番号 を除去してから4文字以上の英単語を取る
     cleaned = re.sub(r'(?:19|20)\d{2}', ' ', line)
-    cleaned = re.sub(r'\b\d+\s*[\(\[]\d+[\)\]]', ' ', cleaned)   # 10(2)
-    cleaned = re.sub(r'\b\d{1,4}\s*[-–]\s*\d{1,4}\b', ' ', cleaned)  # 100-200
-    cleaned = re.sub(r'10\.\d{4,}/\S+', ' ', cleaned)             # DOI
+    cleaned = re.sub(r'\b\d+\s*[\(\[]\d+[\)\]]', ' ', cleaned)
+    cleaned = re.sub(r'\b\d{1,4}\s*[-–]\s*\d{1,4}\b', ' ', cleaned)
+    cleaned = re.sub(r'10\.\d{4,}/\S+', ' ', cleaned)
+    cleaned = re.sub(r'arXiv:\S+', ' ', cleaned, flags=re.IGNORECASE)
     words = re.findall(r'[a-zA-Z]{4,}', cleaned.lower())
-    info["title_keywords"] = [w for w in words if w not in STOPWORDS]
+    words = [w for w in words if w not in STOPWORDS]
 
+    # 著者姓をキーワードから除外（著者名がノイズになるため）
+    if author_families:
+        author_set = {a.lower() for a in author_families if len(a) >= 2}
+        words = [w for w in words if w not in author_set]
+
+    info["title_keywords"] = words
     return info
 
 
@@ -106,8 +121,11 @@ def score_item(item: dict, parsed: dict) -> dict:
     details = []
 
     # ① タイトル双方向F1（最大60点）
+    # DBの著者姓が判明したので、入力KWから著者名ノイズを除去して再計算する
     title_score = 0
-    input_kw = parsed.get("title_keywords", [])
+    author_families = [a.get("family", "") for a in item.get("author", [])]
+    refined = parse_reference(parsed["raw"], author_families)
+    input_kw = refined["title_keywords"]
     db_words = set(
         w for w in re.findall(r'[a-zA-Z]{3,}', db_lower)
         if w not in STOPWORDS
