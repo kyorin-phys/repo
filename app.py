@@ -2,7 +2,6 @@ import time
 import re
 import requests
 import streamlit as st
-from rapidfuzz import fuzz
 
 st.set_page_config(page_title="文献チェッカー", layout="wide")
 
@@ -18,101 +17,21 @@ DEFAULT_WARN_THRESHOLD = 35
 # ─────────────────────────────────────────────
 def parse_reference(line: str) -> dict:
     """
-    典型的な参考文献フォーマットから年・タイトル候補・DOIを抽出する。
-
-    対応フォーマット例:
-      Vaswani A, et al. (2017) Attention is all you need. Advances in NeurIPS, 30.
-      Smith J. Title of paper. J Phys. 2018;5:123. doi:10.1234/abc
-      山田太郎. (2020). タイトル. 雑誌名, 10(2), 100-110.
+    参考文献行から年・DOIだけを抽出する。
+    タイトル推定は行わない（書き方が不定なため信頼できない）。
+    スコアリングは「入力行全体 vs DBの各フィールド」で行う。
     """
-    info = {"raw": line, "year": None, "title_guess": None, "doi": None}
+    info = {"raw": line, "years": [], "doi": None}
 
-    # 年（1900〜2099）
-    year_match = re.search(r'\b(19|20)\d{2}\b', line)
-    if year_match:
-        info["year"] = year_match.group(0)
+    # 年（1900〜2099）を全て抽出（グループなしで4桁まとめてマッチ）
+    info["years"] = re.findall(r'(?:19|20)\d{2}', line)
 
     # DOI
     doi_match = re.search(r'10\.\d{4,}/\S+', line)
     if doi_match:
         info["doi"] = doi_match.group(0).rstrip('.')
 
-    # ── タイトル推定（優先度順） ──────────────────────────────────────
-
-    # 戦略1: "(年)" または "年." の直後のセグメントをタイトルとみなす
-    # 例: "Vaswani A, et al. (2017) Attention is all you need. Advances..."
-    #      → "(2017) の直後" = "Attention is all you need"
-    title_after_year = None
-    m = re.search(r'[\(\s](19|20)\d{2}[\)\.\s]\s*(.+?)(?:\.\s|\.$|$)', line)
-    if m:
-        candidate = m.group(2).strip()
-        # 雑誌名・巻号っぽい特徴がなければ採用
-        if len(candidate) > 10 and not _looks_like_journal_info(candidate):
-            title_after_year = candidate
-
-    # 戦略2: ピリオド区切りで「最もタイトルらしいセグメント」を選ぶ
-    segments = [s.strip() for s in re.split(r'\.\s+', line) if s.strip()]
-    title_candidates = []
-    for s in segments:
-        if len(s) < 10:
-            continue
-        if _looks_like_author_segment(s):
-            continue
-        if _looks_like_journal_info(s):
-            continue
-        # 年を含むセグメントは年の後ろ部分だけ取り出す
-        s_clean = re.sub(r'^.*?(19|20)\d{2}[)\s.]+', '', s).strip()
-        if len(s_clean) > 10:
-            title_candidates.append(s_clean)
-        elif len(s) > 10:
-            title_candidates.append(s)
-
-    # タイトルらしさスコア：小文字が多い・長い・数字が少ない
-    def title_score(s: str) -> float:
-        alpha = sum(c.isalpha() for c in s)
-        digit = sum(c.isdigit() for c in s)
-        return alpha - digit * 3 + len(s) * 0.1
-
-    best_segment = max(title_candidates, key=title_score) if title_candidates else None
-
-    # 戦略1 > 戦略2 の優先順で採用
-    info["title_guess"] = title_after_year or best_segment
     return info
-
-
-def _looks_like_journal_info(s: str) -> bool:
-    """巻号・ページ・雑誌略称っぽい特徴を持つか判定する"""
-    # 巻号パターン: "10(2)", "30:123-145", "vol.10"
-    if re.search(r'\d+\s*[\(\[]\s*\d+\s*[\)\]]', s):
-        return True
-    if re.search(r'\b\d+\s*:\s*\d+', s):
-        return True
-    if re.search(r'\bvol\.?\s*\d+\b', s, re.IGNORECASE):
-        return True
-    # ページ番号: "123-456"
-    if re.search(r'\b\d{1,4}\s*[-–]\s*\d{1,4}\b', s):
-        return True
-    # 大文字略称だらけ（雑誌略称）: "J Phys Chem" など
-    words = s.split()
-    if len(words) <= 5 and sum(1 for w in words if w[0:1].isupper()) == len(words):
-        # 全単語が大文字始まりかつ短い → 雑誌名の可能性
-        if all(len(w) <= 10 for w in words):
-            return True
-    return False
-
-
-def _looks_like_author_segment(s: str) -> bool:
-    """著者リストっぽい特徴を持つか判定する"""
-    # "et al" を含む
-    if re.search(r'\bet\s+al\b', s, re.IGNORECASE):
-        return True
-    # "A, B, C" 形式でカンマ区切りの短い単語の羅列
-    parts = [p.strip() for p in s.split(',')]
-    if len(parts) >= 2 and all(len(p) < 25 for p in parts):
-        # 各パートにイニシャルっぽい大文字1文字を含む
-        if sum(1 for p in parts if re.search(r'\b[A-Z]\b', p)) >= 2:
-            return True
-    return False
 
 
 # ─────────────────────────────────────────────
@@ -133,9 +52,6 @@ def _fetch_crossref(params: dict) -> list:
     except Exception:
         return []
 
-
-def search_by_title(title: str, rows: int = 5) -> list:
-    return _fetch_crossref({"query.title": title, "rows": rows})
 
 
 def search_bibliographic(query: str, rows: int = 8) -> list:
@@ -159,51 +75,69 @@ def score_item(item: dict, parsed: dict) -> dict:
     """
     CrossRefの1件について入力情報との一致度を0〜100点でスコアリングする。
 
+    タイトル推定に頼らず「DBタイトルの語が入力行に何割含まれるか」で判定するため、
+    参考文献の書き方（順序・フォーマット）に依存しない。
+
     内訳:
-      タイトル類似度（token_sort_ratio） … 最大60点
-      年の一致                           … 最大20点
-      著者名（最初の3著者）の一致        … 最大20点
+      タイトル語カバレッジ … 最大60点
+        DBタイトルの意味語（3文字以上・ストップワード除外）が
+        入力行に何割含まれているかで線形配点
+      年の一致             … 最大20点
+      著者姓の一致         … 最大20点（最初の4著者を対象）
     """
     db_title = " ".join(item.get("title", [""])).strip()
+    raw_lower = parsed["raw"].lower()
     score = 0
     details = []
 
-    # ① タイトル類似度（最大60点）
+    # ① タイトル語カバレッジ（最大60点）
     title_score = 0
-    if parsed.get("title_guess") and db_title:
-        ratio = fuzz.token_sort_ratio(
-            parsed["title_guess"].lower(), db_title.lower()
+    if db_title:
+        stopwords = {
+            'the', 'and', 'for', 'with', 'from', 'that', 'this', 'are', 'was',
+            'not', 'but', 'its', 'via', 'using', 'based', 'new', 'study', 'into'
+        }
+        db_words = set(
+            w for w in re.findall(r'[a-zA-Z]{3,}', db_title.lower())
+            if w not in stopwords
         )
-        title_score = int(ratio * 0.60)
-        details.append(f"タイトル類似度: {ratio:.0f}% → {title_score}点")
+        if db_words:
+            matched_words = sum(1 for w in db_words if w in raw_lower)
+            coverage = matched_words / len(db_words)
+            title_score = int(coverage * 60)
+            details.append(
+                f"タイトル語カバレッジ: {matched_words}/{len(db_words)}語 "
+                f"({coverage*100:.0f}%) → {title_score}点"
+            )
     score += title_score
 
     # ② 年の一致（最大20点）
     year_score = 0
     date_parts = (item.get("published", {}).get("date-parts") or [[]])[0]
     db_year = str(date_parts[0]) if date_parts else ""
-    if parsed.get("year"):
-        if db_year == parsed["year"]:
+    input_years = parsed.get("years", [])
+    if input_years and db_year:
+        if db_year in input_years:
             year_score = 20
             details.append(f"年一致 ({db_year}) → 20点")
         else:
-            details.append(f"年不一致 (入力:{parsed['year']} / DB:{db_year}) → 0点")
+            details.append(f"年不一致 (入力:{input_years} / DB:{db_year}) → 0点")
     score += year_score
 
-    # ③ 著者名の一致（最大20点）
+    # ③ 著者姓の一致（最大20点）
     author_score = 0
     authors = item.get("author", [])
     if authors:
-        raw_lower = parsed["raw"].lower()
         matched = sum(
-            1 for a in authors[:3]
-            if a.get("family", "").lower() and a.get("family", "").lower() in raw_lower
+            1 for a in authors[:4]
+            if len(a.get("family", "")) >= 2
+            and a.get("family", "").lower() in raw_lower
         )
         if matched >= 2:
             author_score = 20
         elif matched == 1:
             author_score = 10
-        details.append(f"著者一致: {matched}/3名 → {author_score}点")
+        details.append(f"著者一致: {matched}名 → {author_score}点")
     score += author_score
 
     return {
@@ -233,11 +167,8 @@ def check_reference(line: str, pass_th: int, warn_th: int) -> dict:
             result["method"] = "DOI直接確認"
             return result
 
-    # タイトル推定クエリ ＋ 全文クエリの2段階検索
-    candidates = []
-    if parsed.get("title_guess"):
-        candidates += search_by_title(parsed["title_guess"])
-    candidates += search_bibliographic(line)
+    # 入力行全体でbibliographic検索（書き方に依存しない）
+    candidates = search_bibliographic(line)
 
     # 重複DOI除去
     seen: set = set()
@@ -321,11 +252,11 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("""
 **スコア内訳（100点満点）**
-| 項目 | 最大 |
-|------|------|
-| タイトル類似度 | 60点 |
-| 発表年の一致 | 20点 |
-| 著者名の一致 | 20点 |
+| 項目 | 最大 | 方法 |
+|------|------|------|
+| タイトル語カバレッジ | 60点 | DBタイトルの語が入力行に何割含まれるか |
+| 発表年の一致 | 20点 | 入力行に含まれる年とDBの年を照合 |
+| 著者名の一致 | 20点 | DB著者姓が入力行に含まれるか |
 
 **判定ランク**
 - ✅ **PASS**：しきい値以上（実在の可能性が高い）
