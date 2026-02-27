@@ -21,8 +21,9 @@ def parse_reference(line: str) -> dict:
     典型的な参考文献フォーマットから年・タイトル候補・DOIを抽出する。
 
     対応フォーマット例:
-      Yamada T, et al. (2020) Effects of X on Y. Journal Name, 10(2), 100-110.
+      Vaswani A, et al. (2017) Attention is all you need. Advances in NeurIPS, 30.
       Smith J. Title of paper. J Phys. 2018;5:123. doi:10.1234/abc
+      山田太郎. (2020). タイトル. 雑誌名, 10(2), 100-110.
     """
     info = {"raw": line, "year": None, "title_guess": None, "doi": None}
 
@@ -36,16 +37,82 @@ def parse_reference(line: str) -> dict:
     if doi_match:
         info["doi"] = doi_match.group(0).rstrip('.')
 
-    # タイトル推定：ピリオドで区切り、数字だけ・短すぎるセグメントを除外した中で最長のものを採用
-    segments = [s.strip() for s in re.split(r'\.\s+', line) if s.strip()]
-    filtered = [
-        s for s in segments
-        if not re.fullmatch(r'[\d\s\(\)\-,:;]+', s) and len(s) > 15
-    ]
-    if filtered:
-        info["title_guess"] = max(filtered, key=len)
+    # ── タイトル推定（優先度順） ──────────────────────────────────────
 
+    # 戦略1: "(年)" または "年." の直後のセグメントをタイトルとみなす
+    # 例: "Vaswani A, et al. (2017) Attention is all you need. Advances..."
+    #      → "(2017) の直後" = "Attention is all you need"
+    title_after_year = None
+    m = re.search(r'[\(\s](19|20)\d{2}[\)\.\s]\s*(.+?)(?:\.\s|\.$|$)', line)
+    if m:
+        candidate = m.group(2).strip()
+        # 雑誌名・巻号っぽい特徴がなければ採用
+        if len(candidate) > 10 and not _looks_like_journal_info(candidate):
+            title_after_year = candidate
+
+    # 戦略2: ピリオド区切りで「最もタイトルらしいセグメント」を選ぶ
+    segments = [s.strip() for s in re.split(r'\.\s+', line) if s.strip()]
+    title_candidates = []
+    for s in segments:
+        if len(s) < 10:
+            continue
+        if _looks_like_author_segment(s):
+            continue
+        if _looks_like_journal_info(s):
+            continue
+        # 年を含むセグメントは年の後ろ部分だけ取り出す
+        s_clean = re.sub(r'^.*?(19|20)\d{2}[)\s.]+', '', s).strip()
+        if len(s_clean) > 10:
+            title_candidates.append(s_clean)
+        elif len(s) > 10:
+            title_candidates.append(s)
+
+    # タイトルらしさスコア：小文字が多い・長い・数字が少ない
+    def title_score(s: str) -> float:
+        alpha = sum(c.isalpha() for c in s)
+        digit = sum(c.isdigit() for c in s)
+        return alpha - digit * 3 + len(s) * 0.1
+
+    best_segment = max(title_candidates, key=title_score) if title_candidates else None
+
+    # 戦略1 > 戦略2 の優先順で採用
+    info["title_guess"] = title_after_year or best_segment
     return info
+
+
+def _looks_like_journal_info(s: str) -> bool:
+    """巻号・ページ・雑誌略称っぽい特徴を持つか判定する"""
+    # 巻号パターン: "10(2)", "30:123-145", "vol.10"
+    if re.search(r'\d+\s*[\(\[]\s*\d+\s*[\)\]]', s):
+        return True
+    if re.search(r'\b\d+\s*:\s*\d+', s):
+        return True
+    if re.search(r'\bvol\.?\s*\d+\b', s, re.IGNORECASE):
+        return True
+    # ページ番号: "123-456"
+    if re.search(r'\b\d{1,4}\s*[-–]\s*\d{1,4}\b', s):
+        return True
+    # 大文字略称だらけ（雑誌略称）: "J Phys Chem" など
+    words = s.split()
+    if len(words) <= 5 and sum(1 for w in words if w[0:1].isupper()) == len(words):
+        # 全単語が大文字始まりかつ短い → 雑誌名の可能性
+        if all(len(w) <= 10 for w in words):
+            return True
+    return False
+
+
+def _looks_like_author_segment(s: str) -> bool:
+    """著者リストっぽい特徴を持つか判定する"""
+    # "et al" を含む
+    if re.search(r'\bet\s+al\b', s, re.IGNORECASE):
+        return True
+    # "A, B, C" 形式でカンマ区切りの短い単語の羅列
+    parts = [p.strip() for p in s.split(',')]
+    if len(parts) >= 2 and all(len(p) < 25 for p in parts):
+        # 各パートにイニシャルっぽい大文字1文字を含む
+        if sum(1 for p in parts if re.search(r'\b[A-Z]\b', p)) >= 2:
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────
